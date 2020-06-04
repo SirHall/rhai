@@ -27,6 +27,8 @@ pub enum OpCodes {
     BranchIfTrueCopy = 0x32,
     BranchIfFalse = 0x33,
     BranchIfFalseCopy = 0x34,
+    BranchIfNone = 0x35,
+    BranchIfNoneCopy = 0x36,
 
     #[cfg(not(feature = "no_float"))]
     LoadFloat = 0x80,
@@ -35,6 +37,8 @@ pub enum OpCodes {
     LoadTrue = 0x82,
     LoadFalse = 0x83,
     LoadUnit = 0x84,
+    LoadIterator = 0x85,
+    GetIteratorNext = 0x86,
 
     Negate = 0x90,
     In = 0x91,
@@ -255,6 +259,14 @@ fn print_program(op_codes: &[u8], constants: &[u8]) {
                 let offset = read_offset(op_codes, &mut pc, op_code_offset);
                 println!("BranchIfFalseCopy {}", offset);
             }
+            0x35 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                println!("BranchIfNone {}", offset);
+            }
+            0x36 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                println!("BranchIfNoneCopy {}", offset);
+            }
 
             #[cfg(not(feature = "no_float"))]
             0x80 => {
@@ -274,6 +286,8 @@ fn print_program(op_codes: &[u8], constants: &[u8]) {
             0x82 => println!("LoadTrue"),
             0x83 => println!("LoadFalse"),
             0x84 => println!("LoadUnit"),
+            0x85 => println!("LoadIterator"),
+            0x86 => println!("GetIteratorNext"),
 
             0x90 => println!("Negate"),
             0x91 => println!("In"),
@@ -421,7 +435,44 @@ fn compile_stmt(
             false
         }
 
-        Stmt::For(_) => false,
+        Stmt::For(x) => {
+            let (name, expr, stmt) = x.as_ref();
+
+            compile_expr(expr, op_codes, dict, constants);
+            op_codes.push(OpCodes::LoadIterator as u8);
+            op_codes.push(OpCodes::PushLoop as u8);
+            op_codes.push(OpCodes::PushFrame as u8);
+
+            // Define loop variable
+            op_codes.push(OpCodes::LoadUnit as u8);
+            let offset = push_string(name, dict, constants);
+            op_codes.push(OpCodes::SetVariable as u8 + get_op_code_offset(offset));
+            push_offset(op_codes, offset);
+
+            let pc = op_codes.len();
+            op_codes.push(OpCodes::GetIteratorNext as u8);
+
+            compile_branch(
+                OpCodes::BranchIfNoneCopy,
+                op_codes,
+                dict,
+                constants,
+                |op_codes, dict, constants| {
+                    // TODO =  Assignment to loop variable
+                    if compile_stmt(stmt, op_codes, dict, constants) {
+                        op_codes.push(OpCodes::PopStack as u8);
+                    }
+                    op_codes.push(OpCodes::Jump as u8);
+                    push_offset(op_codes, pc);
+                    op_codes.len()
+                },
+            );
+            op_codes.push(OpCodes::PopStack as u8); // Pop the iterator
+
+            op_codes.push(OpCodes::PopFrame as u8);
+            op_codes.push(OpCodes::PopLoop as u8);
+            false
+        }
 
         Stmt::Let(x) => {
             let ((name, _), expr) = x.as_ref();
@@ -704,7 +755,12 @@ mod test {
         let ast = engine.compile(
             r#"
                 let now = timestamp();
-                if now { let test = [1.0, 0x88, true, 'k', ()] }
+                if now {
+                    let test = [1.0, 0x88, true, 'k', ()];
+                    for s in test {
+                        print(s);
+                    }
+                }
                 let x = 1_000_000;
                 
                 print("Ready... Go!");
