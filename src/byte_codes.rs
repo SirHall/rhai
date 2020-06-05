@@ -1,8 +1,13 @@
+use crate::any::Dynamic;
+use crate::engine::{Array, Map};
 use crate::error::ParseError;
 use crate::parser::{Expr, ReturnType, Stmt, AST, FLOAT, INT};
+use crate::result::EvalAltResult;
+use crate::scope::{EntryType as ScopeEntryType, Scope};
 use crate::token::Position;
+use crate::utils::ImmutableString;
 
-use crate::stdlib::{collections::HashMap, convert::TryFrom, mem};
+use crate::stdlib::{collections::HashMap, convert::TryFrom, mem, str};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum OpCodes {
@@ -139,7 +144,7 @@ fn read_offset(stream: &[u8], pc: &mut usize, op_code_offset: u8) -> usize {
     }
 }
 
-fn read_string(stream: &[u8], offset: usize) -> String {
+fn read_string(stream: &[u8], offset: usize) -> &str {
     let (offset, len) = if stream[offset] < u8::MAX {
         (offset + 1, stream[offset] as usize)
     } else {
@@ -151,7 +156,7 @@ fn read_string(stream: &[u8], offset: usize) -> String {
         )
     };
 
-    String::from_utf8(stream[offset..][..len].to_vec()).unwrap()
+    str::from_utf8(&stream[offset..][..len]).unwrap()
 }
 
 fn print_program(op_codes: &[u8], constants: &[u8]) {
@@ -740,6 +745,248 @@ fn compile_ast(
             op_codes.push(OpCodes::PopStack as u8);
         }
     }
+}
+
+struct Frame {
+    pc: usize,
+    scope_len: usize,
+}
+
+fn eval_program<'a>(
+    op_codes: &[u8],
+    constants: &'a [u8],
+    scope: &mut Scope<'a>,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    let mut frames = Vec::<Frame>::new();
+    let mut stack = Vec::<Dynamic>::new();
+    let mut strings = HashMap::<usize, ImmutableString>::new();
+    let mut always_search = false;
+
+    let mut pc = 0;
+
+    while pc < op_codes.len() {
+        // Decode
+        let op_code = op_codes[pc];
+        pc += 1;
+
+        let (op_code, op_code_offset) =
+            if (0..0x10).contains(&op_code) || (0x30..0x40).contains(&op_code) {
+                (op_code, 0)
+            } else if (0x10..0x20).contains(&op_code) || (0x40..0x50).contains(&op_code) {
+                (op_code - 0x10, 0x10)
+            } else if (0x20..0x30).contains(&op_code) || (0x50..0x60).contains(&op_code) {
+                (op_code - 0x20, 0x20)
+            } else {
+                (op_code, 0)
+            };
+
+        match op_code {
+            0x00 => (),
+
+            0x01 => {
+                let value = read_offset(op_codes, &mut pc, op_code_offset) as INT;
+                stack.push(value.into());
+            }
+            0x02 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let value = strings
+                    .entry(offset)
+                    .or_insert_with(|| read_string(constants, offset).into())
+                    .clone();
+                stack.push(value.into());
+            }
+            0x03 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let value = read_string(constants, offset);
+                let args = op_codes[pc];
+                pc += 1;
+                println!(r#"FnCall {}({})"#, value, args);
+            }
+            0x04 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let value = read_string(constants, offset);
+                let args = op_codes[pc];
+                pc += 1;
+                println!(r#"FnCallNative {}({})"#, value, args);
+            }
+            0x05 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let name = read_string(constants, offset);
+                let (index, _) = scope.get_index(&name).ok_or_else(|| {
+                    Box::new(EvalAltResult::ErrorVariableNotFound(
+                        name.to_string(),
+                        Position::none(),
+                    ))
+                })?;
+                stack.push(scope.get_mut(index).0.clone());
+            }
+            0x06 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let name = read_string(constants, offset);
+                let mut index = op_codes[pc] as usize;
+                pc += 1;
+                if always_search || index == 0 {
+                    index = scope
+                        .get_index(&name)
+                        .ok_or_else(|| {
+                            Box::new(EvalAltResult::ErrorVariableNotFound(
+                                name.to_string(),
+                                Position::none(),
+                            ))
+                        })?
+                        .0;
+                }
+                stack.push(scope.get_mut(index).0.clone());
+            }
+            0x07 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let name = read_string(constants, offset);
+                let mut data = [0_u8; mem::size_of::<usize>()];
+                data.copy_from_slice(&op_codes[pc..][..mem::size_of::<usize>()]);
+                let mut index = usize::from_le_bytes(data);
+                pc += mem::size_of::<usize>();
+                if always_search || index == 0 {
+                    index = scope
+                        .get_index(&name)
+                        .ok_or_else(|| {
+                            Box::new(EvalAltResult::ErrorVariableNotFound(
+                                name.to_string(),
+                                Position::none(),
+                            ))
+                        })?
+                        .0;
+                }
+                stack.push(scope.get_mut(index).0.clone());
+            }
+            0x08 => {
+                let items = read_offset(op_codes, &mut pc, op_code_offset);
+                let mut ar = Array::with_capacity(items);
+                for x in 0..items {
+                    ar[items - 1 - x] = stack.pop().unwrap();
+                }
+                stack.push(ar.into());
+            }
+            0x09 => println!("LoadMap"),
+            0x0c => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let name = read_string(constants, offset);
+                let value = stack.pop().unwrap();
+                scope.push_dynamic(name, value);
+            }
+            0x0d => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                let name = read_string(constants, offset);
+                let value = stack.pop().unwrap();
+                scope.push_dynamic_value(name, ScopeEntryType::Normal, value, false);
+            }
+            0x0e => println!("GetProperty"),
+            0x0f => println!("SetProperty"),
+
+            0x30 => {
+                pc = read_offset(op_codes, &mut pc, op_code_offset) - 1;
+            }
+            0x31 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset) - 1;
+                if stack
+                    .pop()
+                    .unwrap()
+                    .try_cast::<bool>()
+                    .ok_or_else(|| Box::new(EvalAltResult::ErrorLogicGuard(Position::none())))?
+                {
+                    pc = offset;
+                }
+            }
+            0x32 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                if stack
+                    .pop()
+                    .unwrap()
+                    .try_cast::<bool>()
+                    .ok_or_else(|| Box::new(EvalAltResult::ErrorLogicGuard(Position::none())))?
+                {
+                    pc = offset;
+                    stack.push(true.into());
+                }
+            }
+            0x33 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                if !stack
+                    .pop()
+                    .unwrap()
+                    .try_cast::<bool>()
+                    .ok_or_else(|| Box::new(EvalAltResult::ErrorLogicGuard(Position::none())))?
+                {
+                    pc = offset;
+                }
+            }
+            0x34 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                if !stack
+                    .pop()
+                    .unwrap()
+                    .try_cast::<bool>()
+                    .ok_or_else(|| Box::new(EvalAltResult::ErrorLogicGuard(Position::none())))?
+                {
+                    pc = offset;
+                    stack.push(false.into());
+                }
+            }
+            0x35 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                println!("BranchIfNone {}", offset);
+            }
+            0x36 => {
+                let offset = read_offset(op_codes, &mut pc, op_code_offset);
+                println!("BranchIfNoneCopy {}", offset);
+            }
+
+            #[cfg(not(feature = "no_float"))]
+            0x80 => {
+                let mut data = [0_u8; mem::size_of::<FLOAT>()];
+                data.copy_from_slice(&op_codes[pc..][..mem::size_of::<FLOAT>()]);
+                pc += mem::size_of::<FLOAT>();
+                let value = FLOAT::from_le_bytes(data);
+                stack.push(value.into());
+            }
+            0x81 => {
+                let mut data = [0_u8; mem::size_of::<u32>()];
+                data.copy_from_slice(&op_codes[pc..][..mem::size_of::<u32>()]);
+                pc += mem::size_of::<u32>();
+                let ch = char::try_from(u32::from_le_bytes(data)).unwrap();
+                stack.push(ch.into());
+            }
+            0x82 => stack.push(true.into()),
+            0x83 => stack.push(false.into()),
+            0x84 => stack.push(().into()),
+            0x85 => println!("LoadIterator"),
+            0x86 => println!("GetIteratorNext"),
+
+            0x90 => {
+                let value =
+                    stack.pop().unwrap().try_cast::<bool>().ok_or_else(|| {
+                        Box::new(EvalAltResult::ErrorLogicGuard(Position::none()))
+                    })?;
+                stack.push((!value).into());
+            }
+            0x91 => println!("In"),
+            0x92 => println!("Continue"),
+            0x93 => println!("Break"),
+            0x94 => println!("Return"),
+            0x95 => println!("Throw"),
+
+            0xf0 => {
+                stack.pop().unwrap();
+            }
+            0xf1 => println!("PushFrame"),
+            0xf2 => println!("PopFrame"),
+            0xf3 => println!("PushLoop"),
+            0xf4 => println!("PopLoop"),
+
+            _ => panic!("Unknown op-code {:x}", op_code),
+        }
+    }
+
+    Ok(().into())
 }
 
 #[cfg(test)]
