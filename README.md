@@ -37,7 +37,7 @@ Features
   to do checked arithmetic operations); for [`no-std`](#optional-features) builds, a number of additional dependencies are
   pulled in to provide for functionalities that used to be in `std`.
 
-**Note:** Currently, the version is `0.16.0`, so the language and API's may change before they stabilize.
+**Note:** Currently, the version is `0.15.1`, so the language and API's may change before they stabilize.
 
 What Rhai doesn't do
 --------------------
@@ -71,7 +71,7 @@ Install the Rhai crate on [`crates.io`](https::/crates.io/crates/rhai/) by addin
 
 ```toml
 [dependencies]
-rhai = "0.16.0"
+rhai = "0.15.1"
 ```
 
 Use the latest released crate version on [`crates.io`](https::/crates.io/crates/rhai/):
@@ -179,13 +179,14 @@ A number of examples can be found in the `examples` folder:
 
 | Example                                                            | Description                                                                 |
 | ------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| [`arrays_and_structs`](examples/arrays_and_structs.rs)             | demonstrates registering a new type to Rhai and the usage of [arrays] on it |
-| [`custom_types_and_methods`](examples/custom_types_and_methods.rs) | shows how to register a type and methods for it                             |
+| [`arrays_and_structs`](examples/arrays_and_structs.rs)             | shows how to register a custom Rust type and using [arrays] on it           |
+| [`custom_types_and_methods`](examples/custom_types_and_methods.rs) | shows how to register a custom Rust type and methods for it                 |
 | [`hello`](examples/hello.rs)                                       | simple example that evaluates an expression and prints the result           |
 | [`no_std`](examples/no_std.rs)                                     | example to test out `no-std` builds                                         |
 | [`reuse_scope`](examples/reuse_scope.rs)                           | evaluates two pieces of code in separate runs, but using a common [`Scope`] |
 | [`rhai_runner`](examples/rhai_runner.rs)                           | runs each filename passed to it as a Rhai script                            |
-| [`simple_fn`](examples/simple_fn.rs)                               | shows how to register a Rust function to a Rhai [`Engine`]                  |
+| [`simple_fn`](examples/simple_fn.rs)                               | shows how to register a simple function                                     |
+| [`strings`](examples/strings.rs)                                   | shows different ways to register functions taking string arguments          |
 | [`repl`](examples/repl.rs)                                         | a simple REPL, interactively evaluate statements from stdin                 |
 
 Examples can be run with the following command:
@@ -314,8 +315,8 @@ Functions declared with `private` are hidden and cannot be called from Rust (see
 ```rust
 // Define functions in a script.
 let ast = engine.compile(true,
-    r"
-        // a function with two parameters: String and i64
+    r#"
+        // a function with two parameters: string and i64
         fn hello(x, y) {
             x.len + y
         }
@@ -334,7 +335,7 @@ let ast = engine.compile(true,
         private hidden() {
             throw "you shouldn't see me!";
         }
-    ")?;
+    "#)?;
 
 // A custom scope can also contain any variables/constants available to the functions
 let mut scope = Scope::new();
@@ -472,7 +473,7 @@ The follow packages are available:
 Packages typically contain Rust functions that are callable within a Rhai script.
 All functions registered in a package is loaded under the _global namespace_ (i.e. they're available without module qualifiers).
 Once a package is created (e.g. via `new`), it can be _shared_ (via `get`) among multiple instances of [`Engine`],
-even across threads (under the [`sync`] feature). Therefore, a package only has to be created _once_.
+even across threads (under [`sync`]). Therefore, a package only has to be created _once_.
 
 Packages are actually implemented as [modules], so they share a lot of behavior and characteristics.
 The main difference is that a package loads under the _global_ namespace, while a module loads under its own
@@ -521,7 +522,7 @@ The following primitive types are supported natively:
 | **Floating-point number** (disabled with [`no_float`])                        | `f32`, `f64` _(default)_                                                                             | `"f32"` or `"f64"`    | `"123.4567"` etc.     |
 | **Boolean value**                                                             | `bool`                                                                                               | `"bool"`              | `"true"` or `"false"` |
 | **Unicode character**                                                         | `char`                                                                                               | `"char"`              | `"A"`, `"x"` etc.     |
-| **Immutable Unicode string**                                                  | `rhai::ImmutableString` (implemented as `Rc<String>` or `Arc<String>`, _not_ `&str`)                 | `"string"`            | `"hello"` etc.        |
+| **Immutable Unicode string**                                                  | `rhai::ImmutableString` (implemented as `Rc<String>` or `Arc<String>`)                               | `"string"`            | `"hello"` etc.        |
 | **Array** (disabled with [`no_index`])                                        | `rhai::Array`                                                                                        | `"array"`             | `"[ ?, ?, ? ]"`       |
 | **Object map** (disabled with [`no_object`])                                  | `rhai::Map`                                                                                          | `"map"`               | `#{ "a": 1, "b": 2 }` |
 | **Timestamp** (implemented in the [`BasicTimePackage`](#packages))            | `std::time::Instant`                                                                                 | `"timestamp"`         | _not supported_       |
@@ -572,7 +573,7 @@ if type_of(x) == "string" {
 
 [`Dynamic`]: #dynamic-values
 
-A `Dynamic` value can be _any_ type. However, under the [`sync`] feature, all types must be `Send + Sync`.
+A `Dynamic` value can be _any_ type. However, under [`sync`], all types must be `Send + Sync`.
 
 Because [`type_of()`] a `Dynamic` value returns the type of the actual value, it is usually used to perform type-specific
 actions based on the actual value's type.
@@ -684,13 +685,18 @@ Rhai's scripting engine is very lightweight.  It gets most of its abilities from
 To call these functions, they need to be registered with the [`Engine`].
 
 ```rust
-use rhai::{Dynamic, Engine, EvalAltResult};
+use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString};
 use rhai::RegisterFn;                           // use 'RegisterFn' trait for 'register_fn'
 use rhai::RegisterResultFn;                     // use 'RegisterResultFn' trait for 'register_result_fn'
 
-// Normal function that returns any value type
-fn add(x: i64, y: i64) -> i64 {
-    x + y
+// Normal function that returns a standard type
+// Remember to use 'ImmutableString' and not 'String'
+fn add_len(x: i64, s: ImmutableString) -> i64 {
+    x + s.len()
+}
+// Alternatively, '&str' maps directly to 'ImmutableString'
+fn add_len_str(x: i64, s: &str) -> i64 {
+    x + s.len()
 }
 
 // Function that returns a 'Dynamic' value - must return a 'Result'
@@ -702,9 +708,14 @@ fn main() -> Result<(), Box<EvalAltResult>>
 {
     let engine = Engine::new();
 
-    engine.register_fn("add", add);
+    engine.register_fn("add", add_len);
+    engine.register_fn("add_str", add_len_str);
 
-    let result = engine.eval::<i64>("add(40, 2)")?;
+    let result = engine.eval::<i64>(r#"add(40, "xx")"#)?;
+
+    println!("Answer: {}", result);             // prints 42
+
+    let result = engine.eval::<i64>(r#"add_str(40, "xx")"#)?;
 
     println!("Answer: {}", result);             // prints 42
 
@@ -727,13 +738,32 @@ use rhai::Dynamic;
 
 let x = (42_i64).into();                        // 'into()' works for standard types
 
-let y = Dynamic::from(String::from("hello!"));  // remember &str is not supported by Rhai
+let y = Dynamic::from("hello!".to_string());    // remember &str is not supported by Rhai
 ```
 
 Functions registered with the [`Engine`] can be _overloaded_ as long as the _signature_ is unique,
 i.e. different functions can have the same name as long as their parameters are of different types
 and/or different number.
 New definitions _overwrite_ previous definitions of the same name and same number/types of parameters.
+
+### `String` parameters
+
+Functions accepting a parameter of `String` should use `&str` instead because it maps directly to `ImmutableString`
+which is the type that Rhai uses to represent strings internally.
+
+```rust
+fn get_len1(s: String) -> i64 { s.len() as i64 }            // <- Rhai will not find this function
+fn get_len2(s: &str) -> i64 { s.len() as i64 }              // <- Rhai finds this function fine
+fn get_len3(s: ImmutableString) -> i64 { s.len() as i64 }   // <- the above is equivalent to this
+
+engine.register_fn("len1", get_len1);
+engine.register_fn("len2", get_len2);
+engine.register_fn("len3", get_len3);
+
+let len = engine.eval::<i64>("x.len1()")?;                  // error: function 'len1 (string)' not found
+let len = engine.eval::<i64>("x.len2()")?;                  // works fine
+let len = engine.eval::<i64>("x.len3()")?;                  // works fine
+```
 
 Generic functions
 -----------------
@@ -975,8 +1005,8 @@ let result = engine.eval::<i64>(
 println!("result: {}", result);                     // prints 1
 ```
 
-Under the [`no_object`] feature, however, the _method_ style of function calls
-(i.e. calling a function as an object-method) is no longer supported.
+Under [`no_object`], however, the _method_ style of function calls (i.e. calling a function as an object-method)
+is no longer supported.
 
 ```rust
 // Below is a syntax error under 'no_object' because 'clear' cannot be called in method style.
@@ -999,8 +1029,7 @@ let x = new_ts();
 print(x.type_of());                                 // prints "Hello"
 ```
 
-Getters and setters
--------------------
+### Getters and setters
 
 Similarly, custom types can expose members by registering a `get` and/or `set` function.
 
@@ -1010,13 +1039,13 @@ struct TestStruct {
     field: String
 }
 
-// Remember Rhai uses 'ImmutableString' instead of 'String'
 impl TestStruct {
-    fn get_field(&mut self) -> ImmutableString {
-        // Make an 'ImmutableString' from a 'String'
-        self.field.into(0)
+    // Returning a 'String' is OK - Rhai converts it into 'ImmutableString'
+    fn get_field(&mut self) -> String {
+        self.field.clone()
     }
 
+    // Remember Rhai uses 'ImmutableString' or '&str' instead of 'String'
     fn set_field(&mut self, new_val: ImmutableString) {
         // Get a 'String' from an 'ImmutableString'
         self.field = (*new_val).clone();
@@ -1040,12 +1069,10 @@ let result = engine.eval::<String>(r#"let a = new_ts(); a.xyz = "42"; a.xyz"#)?;
 println!("Answer: {}", result);                     // prints 42
 ```
 
-Indexers
---------
+### Indexers
 
 Custom types can also expose an _indexer_ by registering an indexer function.
 A custom type with an indexer function defined can use the bracket '`[]`' notation to get a property value
-(but not update it - indexers are read-only).
 
 ```rust
 #[derive(Clone)]
@@ -1057,9 +1084,12 @@ impl TestStruct {
     fn get_field(&mut self, index: i64) -> i64 {
         self.fields[index as usize]
     }
+    fn set_field(&mut self, index: i64, value: i64) {
+        self.fields[index as usize] = value
+    }
 
     fn new() -> Self {
-        TestStruct { fields: vec![1, 2, 42, 4, 5] }
+        TestStruct { fields: vec![1, 2, 3, 4, 5] }
     }
 }
 
@@ -1068,31 +1098,40 @@ let engine = Engine::new();
 engine.register_type::<TestStruct>();
 
 engine.register_fn("new_ts", TestStruct::new);
-engine.register_indexer(TestStruct::get_field);
 
-let result = engine.eval::<i64>("let a = new_ts(); a[2]")?;
+// Shorthand: engine.register_indexer_get_set(TestStruct::get_field, TestStruct::set_field);
+engine.register_indexer_get(TestStruct::get_field);
+engine.register_indexer_set(TestStruct::set_field);
+
+let result = engine.eval::<i64>("let a = new_ts(); a[2] = 42; a[2]")?;
 
 println!("Answer: {}", result);                     // prints 42
 ```
 
-Needless to say, `register_type`, `register_type_with_name`, `register_get`, `register_set`, `register_get_set`
-and `register_indexer` are not available under the [`no_object`] feature.
-`register_indexer` is also not available under the [`no_index`] feature.
+For efficiency reasons, indexers **cannot** be used to overload (i.e. override) built-in indexing operations for
+[arrays] and [object maps].
 
-Printing for custom types
--------------------------
+### Disabling custom types
 
-To use custom types for `print` and `debug`, or format its value into a [string], it is necessary that the following
-functions be registered (assuming the custom type is `T` and it is `Display + Debug`):
+The custom types API `register_type`, `register_type_with_name`, `register_get`, `register_set`, `register_get_set`,
+`register_indexer_get`, `register_indexer_set` and `register_indexer_get_set` are not available under [`no_object`].
 
-| Function    | Signature                                        | Typical implementation         | Usage                                                                                   |
-| ----------- | ------------------------------------------------ | ------------------------------ | --------------------------------------------------------------------------------------- |
-| `to_string` | `|s: &mut T| -> String`                          | `s.to_string()`                | Converts the custom type into a [string]                                                |
-| `print`     | `|s: &mut T| -> String`                          | `s.to_string()`                | Converts the custom type into a [string] for the [`print`](#print-and-debug) statement  |
-| `debug`     | `|s: &mut T| -> String`                          | `format!("{:?}", s)`           | Converts the custom type into a [string] for the [`debug`](#print-and-debug) statement  |
-| `+`         | `|s1: ImmutableString, s: T| -> ImmutableString` | `s1 + s`                       | Append the custom type to another [string], for `print("Answer: " + type);` usage       |
-| `+`         | `|s: T, s2: ImmutableString| -> String`          | `s.to_string().push_str(&s2);` | Append another [string] to the custom type, for `print(type + " is the answer");` usage |
-| `+=`        | `|s1: &mut ImmutableString, s: T|`               | `s1 += s.to_string()`          | Append the custom type to an existing [string], for `s += type;` usage                  |
+The indexers API `register_indexer_get`, `register_indexer_set` and `register_indexer_get_set` are also
+not available under [`no_index`].
+
+### Printing for custom types
+
+To use custom types for `print` and `debug`, or convert its value into a [string], it is necessary that the following
+functions be registered (assuming the custom type is `T : Display + Debug`):
+
+| Function    | Signature                                        | Typical implementation                | Usage                                                                                   |
+| ----------- | ------------------------------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------- |
+| `to_string` | `|s: &mut T| -> ImmutableString`                 | `s.to_string().into()`                | Converts the custom type into a [string]                                                |
+| `print`     | `|s: &mut T| -> ImmutableString`                 | `s.to_string().into()`                | Converts the custom type into a [string] for the [`print`](#print-and-debug) statement  |
+| `debug`     | `|s: &mut T| -> ImmutableString`                 | `format!("{:?}", s).into()`           | Converts the custom type into a [string] for the [`debug`](#print-and-debug) statement  |
+| `+`         | `|s1: ImmutableString, s: T| -> ImmutableString` | `s1 + s`                              | Append the custom type to another [string], for `print("Answer: " + type);` usage       |
+| `+`         | `|s: T, s2: ImmutableString| -> ImmutableString` | `s.to_string().push_str(&s2).into();` | Append another [string] to the custom type, for `print(type + " is the answer");` usage |
+| `+=`        | `|s1: &mut ImmutableString, s: T|`               | `s1 += s.to_string()`                 | Append the custom type to an existing [string], for `s += type;` usage                  |
 
 `Scope` - Initializing and maintaining state
 -------------------------------------------
@@ -1103,7 +1142,7 @@ By default, Rhai treats each [`Engine`] invocation as a fresh one, persisting on
 but no global state. This gives each evaluation a clean starting slate. In order to continue using the same global state
 from one invocation to the next, such a state must be manually created and passed in.
 
-All `Scope` variables are [`Dynamic`], meaning they can store values of any type.  Under the [`sync`] feature, however,
+All `Scope` variables are [`Dynamic`], meaning they can store values of any type.  Under [`sync`], however,
 only types that are `Send + Sync` are supported, and the entire `Scope` itself will also be `Send + Sync`.
 This is extremely useful in multi-threaded applications.
 
@@ -1205,7 +1244,7 @@ The following are reserved keywords in Rhai:
 | `import`, `export`, `as`                          | Modules               |        [`no_module`]        |
 
 Keywords cannot be the name of a [function] or [variable], unless the relevant exclusive feature is enabled.
-For example, `fn` is a valid variable name under the [`no_function`] feature.
+For example, `fn` is a valid variable name under [`no_function`].
 
 Statements
 ----------
@@ -1378,6 +1417,9 @@ Strings and Chars
 [string]: #strings-and-chars
 [strings]: #strings-and-chars
 [char]: #strings-and-chars
+
+All strings in Rhai are implemented as `ImmutableString` (see [standard types]).
+`ImmutableString` should be used in place of the standard Rust type `String` when registering functions.
 
 String and character literals follow C-style formatting, with support for Unicode ('`\u`_xxxx_' or '`\U`_xxxxxxxx_')
 and hex ('`\x`_xx_') escape sequences.
@@ -2375,10 +2417,10 @@ which simply loads a script file based on the path (with `.rhai` extension attac
 
 Built-in module resolvers are grouped under the `rhai::module_resolvers` module namespace.
 
-| Module Resolver        | Description                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `FileModuleResolver`   | The default module resolution service, not available under the [`no_std`] feature. Loads a script file (based off the current directory) with `.rhai` extension.<br/>The base directory can be changed via the `FileModuleResolver::new_with_path()` constructor function.<br/>`FileModuleResolver::create_module()` loads a script file and returns a module. |
-| `StaticModuleResolver` | Loads modules that are statically added. This can be used under the [`no_std`] feature.                                                                                                                                                                                                                                                                        |
+| Module Resolver        | Description                                                                                                                                                                                                                                                                                                                                        |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FileModuleResolver`   | The default module resolution service, not available under [`no_std`]. Loads a script file (based off the current directory) with `.rhai` extension.<br/>The base directory can be changed via the `FileModuleResolver::new_with_path()` constructor function.<br/>`FileModuleResolver::create_module()` loads a script file and returns a module. |
+| `StaticModuleResolver` | Loads modules that are statically added. This can be used under [`no_std`].                                                                                                                                                                                                                                                                        |
 
 An [`Engine`]'s module resolver is set via a call to `Engine::set_module_resolver`:
 

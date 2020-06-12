@@ -1,7 +1,10 @@
 //! Module that defines the extern API of `Engine`.
 
 use crate::any::{Dynamic, Variant};
-use crate::engine::{make_getter, make_setter, Engine, State, FUNC_INDEXER};
+use crate::engine::{
+    get_script_function_by_signature, make_getter, make_setter, Engine, State, FUNC_INDEXER_GET,
+    FUNC_INDEXER_SET,
+};
 use crate::error::ParseError;
 use crate::fn_call::FuncArgs;
 use crate::fn_native::{IteratorFn, SendSync};
@@ -273,7 +276,7 @@ impl Engine {
         self.register_set(name, set_fn);
     }
 
-    /// Register an indexer function for a registered type with the `Engine`.
+    /// Register an index getter for a registered type with the `Engine`.
     ///
     /// The function signature must start with `&mut self` and not `&self`.
     ///
@@ -303,7 +306,7 @@ impl Engine {
     /// engine.register_fn("new_ts", TestStruct::new);
     ///
     /// // Register an indexer.
-    /// engine.register_indexer(TestStruct::get_field);
+    /// engine.register_indexer_get(TestStruct::get_field);
     ///
     /// assert_eq!(engine.eval::<i64>("let a = new_ts(); a[2]")?, 3);
     /// # Ok(())
@@ -311,7 +314,7 @@ impl Engine {
     /// ```
     #[cfg(not(feature = "no_object"))]
     #[cfg(not(feature = "no_index"))]
-    pub fn register_indexer<T, X, U>(
+    pub fn register_indexer_get<T, X, U>(
         &mut self,
         callback: impl Fn(&mut T, X) -> U + SendSync + 'static,
     ) where
@@ -319,7 +322,103 @@ impl Engine {
         U: Variant + Clone,
         X: Variant + Clone,
     {
-        self.register_fn(FUNC_INDEXER, callback);
+        self.register_fn(FUNC_INDEXER_GET, callback);
+    }
+
+    /// Register an index setter for a registered type with the `Engine`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// #[derive(Clone)]
+    /// struct TestStruct {
+    ///     fields: Vec<i64>
+    /// }
+    ///
+    /// impl TestStruct {
+    ///     fn new() -> Self                { TestStruct { fields: vec![1, 2, 3, 4, 5] } }
+    ///     fn set_field(&mut self, index: i64, value: i64) { self.fields[index as usize] = value; }
+    /// }
+    ///
+    /// # fn main() -> Result<(), Box<rhai::EvalAltResult>> {
+    /// use rhai::{Engine, RegisterFn};
+    ///
+    /// let mut engine = Engine::new();
+    ///
+    /// // Register the custom type.
+    /// engine.register_type::<TestStruct>();
+    ///
+    /// engine.register_fn("new_ts", TestStruct::new);
+    ///
+    /// // Register an indexer.
+    /// engine.register_indexer_set(TestStruct::set_field);
+    ///
+    /// assert_eq!(
+    ///     engine.eval::<TestStruct>("let a = new_ts(); a[2] = 42; a")?.fields[2],
+    ///     42
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(not(feature = "no_object"))]
+    #[cfg(not(feature = "no_index"))]
+    pub fn register_indexer_set<T, X, U>(
+        &mut self,
+        callback: impl Fn(&mut T, X, U) -> () + SendSync + 'static,
+    ) where
+        T: Variant + Clone,
+        U: Variant + Clone,
+        X: Variant + Clone,
+    {
+        self.register_fn(FUNC_INDEXER_SET, callback);
+    }
+
+    /// Shorthand for register both index getter and setter functions for a registered type with the `Engine`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// #[derive(Clone)]
+    /// struct TestStruct {
+    ///     fields: Vec<i64>
+    /// }
+    ///
+    /// impl TestStruct {
+    ///     fn new() -> Self                { TestStruct { fields: vec![1, 2, 3, 4, 5] } }
+    ///     fn get_field(&mut self, index: i64) -> i64      { self.fields[index as usize] }
+    ///     fn set_field(&mut self, index: i64, value: i64) { self.fields[index as usize] = value; }
+    /// }
+    ///
+    /// # fn main() -> Result<(), Box<rhai::EvalAltResult>> {
+    /// use rhai::{Engine, RegisterFn};
+    ///
+    /// let mut engine = Engine::new();
+    ///
+    /// // Register the custom type.
+    /// engine.register_type::<TestStruct>();
+    ///
+    /// engine.register_fn("new_ts", TestStruct::new);
+    ///
+    /// // Register an indexer.
+    /// engine.register_indexer_get_set(TestStruct::get_field, TestStruct::set_field);
+    ///
+    /// assert_eq!(engine.eval::<i64>("let a = new_ts(); a[2] = 42; a[2]")?, 42);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(not(feature = "no_object"))]
+    #[cfg(not(feature = "no_index"))]
+    pub fn register_indexer_get_set<T, X, U>(
+        &mut self,
+        getter: impl Fn(&mut T, X) -> U + SendSync + 'static,
+        setter: impl Fn(&mut T, X, U) -> () + SendSync + 'static,
+    ) where
+        T: Variant + Clone,
+        U: Variant + Clone,
+        X: Variant + Clone,
+    {
+        self.register_indexer_get(getter);
+        self.register_indexer_set(setter);
     }
 
     /// Compile a string into an `AST`, which can be used later for evaluation.
@@ -1077,10 +1176,7 @@ impl Engine {
         arg_values: &mut [Dynamic],
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let mut args: StaticVec<_> = arg_values.iter_mut().collect();
-        let lib = ast.lib();
-
-        let fn_def = lib
-            .get_function_by_signature(name, args.len(), true)
+        let fn_def = get_script_function_by_signature(ast.lib(), name, args.len(), true)
             .ok_or_else(|| {
                 Box::new(EvalAltResult::ErrorFunctionNotFound(
                     name.into(),
@@ -1091,7 +1187,7 @@ impl Engine {
         let mut state = State::new();
         let args = args.as_mut();
 
-        self.call_script_fn(scope, &mut state, &lib, name, fn_def, args, 0)
+        self.call_script_fn(scope, &mut state, ast.lib(), name, fn_def, args, 0)
     }
 
     /// Optimize the `AST` with constants defined in an external Scope.
@@ -1114,8 +1210,9 @@ impl Engine {
     ) -> AST {
         let lib = ast
             .lib()
-            .iter()
-            .map(|(_, fn_def)| fn_def.as_ref().clone())
+            .iter_fn()
+            .filter(|(_, _, _, f)| f.is_script())
+            .map(|(_, _, _, f)| f.get_fn_def().clone())
             .collect();
 
         let stmt = mem::take(ast.statements_mut());

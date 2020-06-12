@@ -3,16 +3,16 @@
 use crate::any::{Dynamic, Union};
 use crate::calc_fn_hash;
 use crate::error::ParseErrorType;
-use crate::fn_native::{CallableFunction, Callback, FnCallArgs, Shared};
+use crate::fn_native::{CallableFunction, Callback, FnCallArgs};
 use crate::module::{resolvers, Module, ModuleResolver};
 use crate::optimize::OptimizationLevel;
 use crate::packages::{CorePackage, Package, PackageLibrary, PackagesCollection, StandardPackage};
-use crate::parser::{Expr, FnAccess, FnDef, ImmutableString, ReturnType, Stmt, AST, INT};
+use crate::parser::{Expr, FnAccess, ImmutableString, ReturnType, ScriptFnDef, Stmt, AST, INT};
 use crate::r#unsafe::{unsafe_cast_var_name_to_lifetime, unsafe_mut_cast_to_lifetime};
 use crate::result::EvalAltResult;
 use crate::scope::{EntryType as ScopeEntryType, Scope};
 use crate::token::Position;
-use crate::utils::{StaticVec, StraightHasherBuilder};
+use crate::utils::StaticVec;
 
 #[cfg(not(feature = "no_float"))]
 use crate::parser::FLOAT;
@@ -24,7 +24,6 @@ use crate::stdlib::{
     format,
     iter::{empty, once},
     mem,
-    ops::{Deref, DerefMut},
     string::{String, ToString},
     vec::Vec,
 };
@@ -75,9 +74,11 @@ pub const KEYWORD_EVAL: &str = "eval";
 pub const FUNC_TO_STRING: &str = "to_string";
 pub const FUNC_GETTER: &str = "get$";
 pub const FUNC_SETTER: &str = "set$";
-pub const FUNC_INDEXER: &str = "$index$";
+pub const FUNC_INDEXER_GET: &str = "$index$get$";
+pub const FUNC_INDEXER_SET: &str = "$index$set$";
 
 /// A type that encapsulates a mutation target for an expression with side effects.
+#[derive(Debug)]
 enum Target<'a> {
     /// The target is a mutable reference to a `Dynamic` value somewhere.
     Ref(&'a mut Dynamic),
@@ -92,40 +93,45 @@ impl Target<'_> {
     /// Is the `Target` a reference pointing to other data?
     pub fn is_ref(&self) -> bool {
         match self {
-            Target::Ref(_) => true,
-            Target::Value(_) | Target::StringChar(_, _, _) => false,
+            Self::Ref(_) => true,
+            Self::Value(_) | Self::StringChar(_, _, _) => false,
         }
     }
-
+    /// Is the `Target` an owned value?
+    pub fn is_value(&self) -> bool {
+        match self {
+            Self::Ref(_) => false,
+            Self::Value(_) => true,
+            Self::StringChar(_, _, _) => false,
+        }
+    }
     /// Get the value of the `Target` as a `Dynamic`, cloning a referenced value if necessary.
     pub fn clone_into_dynamic(self) -> Dynamic {
         match self {
-            Target::Ref(r) => r.clone(),        // Referenced value is cloned
-            Target::Value(v) => v,              // Owned value is simply taken
-            Target::StringChar(_, _, ch) => ch, // Character is taken
+            Self::Ref(r) => r.clone(),        // Referenced value is cloned
+            Self::Value(v) => v,              // Owned value is simply taken
+            Self::StringChar(_, _, ch) => ch, // Character is taken
         }
     }
-
     /// Get a mutable reference from the `Target`.
     pub fn as_mut(&mut self) -> &mut Dynamic {
         match self {
-            Target::Ref(r) => *r,
-            Target::Value(ref mut r) => r,
-            Target::StringChar(_, _, ref mut r) => r,
+            Self::Ref(r) => *r,
+            Self::Value(ref mut r) => r,
+            Self::StringChar(_, _, ref mut r) => r,
         }
     }
-
     /// Update the value of the `Target`.
     /// Position in `EvalAltResult` is None and must be set afterwards.
     pub fn set_value(&mut self, new_val: Dynamic) -> Result<(), Box<EvalAltResult>> {
         match self {
-            Target::Ref(r) => **r = new_val,
-            Target::Value(_) => {
+            Self::Ref(r) => **r = new_val,
+            Self::Value(_) => {
                 return Err(Box::new(EvalAltResult::ErrorAssignmentToUnknownLHS(
                     Position::none(),
                 )))
             }
-            Target::StringChar(Dynamic(Union::Str(ref mut s)), index, _) => {
+            Self::StringChar(Dynamic(Union::Str(ref mut s)), index, _) => {
                 // Replace the character at the specified index position
                 let new_ch = new_val
                     .as_char()
@@ -164,20 +170,17 @@ impl<T: Into<Dynamic>> From<T> for Target<'_> {
 ///
 /// This type uses some unsafe code, mainly for avoiding cloning of local variable names via
 /// direct lifetime casting.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Default)]
 pub struct State {
     /// Normally, access to variables are parsed with a relative offset into the scope to avoid a lookup.
     /// In some situation, e.g. after running an `eval` statement, subsequent offsets become mis-aligned.
     /// When that happens, this flag is turned on to force a scope lookup by name.
     pub always_search: bool,
-
     /// Level of the current scope.  The global (root) level is zero, a new block (or function call)
     /// is one level higher, and so on.
     pub scope_level: usize,
-
     /// Number of operations performed.
     pub operations: u64,
-
     /// Number of modules loaded.
     pub modules: u64,
 }
@@ -189,88 +192,24 @@ impl State {
     }
 }
 
-/// A type that holds a library (`HashMap`) of script-defined functions.
-///
-/// Since script-defined functions have `Dynamic` parameters, functions with the same name
-/// and number of parameters are considered equivalent.
-///
-/// The key of the `HashMap` is a `u64` hash calculated by the function `calc_fn_hash`.
-#[derive(Debug, Clone, Default)]
-pub struct FunctionsLib(HashMap<u64, Shared<FnDef>, StraightHasherBuilder>);
+/// Get a script-defined function definition from a module.
+pub fn get_script_function_by_signature<'a>(
+    module: &'a Module,
+    name: &str,
+    params: usize,
+    public_only: bool,
+) -> Option<&'a ScriptFnDef> {
+    // Qualifiers (none) + function name + number of arguments.
+    let hash_script = calc_fn_hash(empty(), name, params, empty());
+    let func = module.get_fn(hash_script)?;
+    if !func.is_script() {
+        return None;
+    }
+    let fn_def = func.get_fn_def();
 
-impl FunctionsLib {
-    /// Create a new `FunctionsLib` from a collection of `FnDef`.
-    pub fn from_iter(vec: impl IntoIterator<Item = FnDef>) -> Self {
-        FunctionsLib(
-            vec.into_iter()
-                .map(|fn_def| {
-                    // Qualifiers (none) + function name + number of arguments.
-                    let hash = calc_fn_hash(empty(), &fn_def.name, fn_def.params.len(), empty());
-                    (hash, fn_def.into())
-                })
-                .collect(),
-        )
-    }
-    /// Does a certain function exist in the `FunctionsLib`?
-    ///
-    /// The `u64` hash is calculated by the function `crate::calc_fn_hash`.
-    pub fn has_function(&self, hash_fn_def: u64) -> bool {
-        self.contains_key(&hash_fn_def)
-    }
-    /// Get a function definition from the `FunctionsLib`.
-    ///
-    /// The `u64` hash is calculated by the function `crate::calc_fn_hash`.
-    pub fn get_function(&self, hash_fn_def: u64) -> Option<&FnDef> {
-        self.get(&hash_fn_def).map(|fn_def| fn_def.as_ref())
-    }
-    /// Get a function definition from the `FunctionsLib`.
-    pub fn get_function_by_signature(
-        &self,
-        name: &str,
-        params: usize,
-        public_only: bool,
-    ) -> Option<&FnDef> {
-        // Qualifiers (none) + function name + number of arguments.
-        let hash_fn_def = calc_fn_hash(empty(), name, params, empty());
-        let fn_def = self.get_function(hash_fn_def);
-
-        match fn_def.as_ref().map(|f| f.access) {
-            None => None,
-            Some(FnAccess::Private) if public_only => None,
-            Some(FnAccess::Private) | Some(FnAccess::Public) => fn_def,
-        }
-    }
-    /// Merge another `FunctionsLib` into this `FunctionsLib`.
-    pub fn merge(&self, other: &Self) -> Self {
-        if self.is_empty() {
-            other.clone()
-        } else if other.is_empty() {
-            self.clone()
-        } else {
-            let mut functions = self.clone();
-            functions.extend(other.iter().map(|(hash, fn_def)| (*hash, fn_def.clone())));
-            functions
-        }
-    }
-}
-
-impl From<Vec<(u64, Shared<FnDef>)>> for FunctionsLib {
-    fn from(values: Vec<(u64, Shared<FnDef>)>) -> Self {
-        FunctionsLib(values.into_iter().collect())
-    }
-}
-
-impl Deref for FunctionsLib {
-    type Target = HashMap<u64, Shared<FnDef>, StraightHasherBuilder>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for FunctionsLib {
-    fn deref_mut(&mut self) -> &mut HashMap<u64, Shared<FnDef>, StraightHasherBuilder> {
-        &mut self.0
+    match fn_def.access {
+        FnAccess::Private if public_only => None,
+        FnAccess::Private | FnAccess::Public => Some(&fn_def),
     }
 }
 
@@ -289,7 +228,7 @@ impl DerefMut for FunctionsLib {
 /// # }
 /// ```
 ///
-/// Currently, `Engine` is neither `Send` nor `Sync`. Turn on the `sync` feature to make it `Send + Sync`.
+/// Currently, `Engine` is neither `Send` nor `Sync`. Use the `sync` feature to make it `Send + Sync`.
 pub struct Engine {
     /// A module containing all functions directly loaded into the Engine.
     pub(crate) global_module: Module,
@@ -426,14 +365,23 @@ fn search_scope<'s, 'a>(
         _ => unreachable!(),
     };
 
+    // Check if it is qualified
     if let Some(modules) = modules.as_ref() {
-        let module = if let Some(index) = modules.index() {
+        // Qualified - check if the root module is directly indexed
+        let index = if state.always_search {
+            None
+        } else {
+            modules.index()
+        };
+
+        let module = if let Some(index) = index {
             scope
                 .get_mut(scope.len() - index.get())
                 .0
                 .downcast_mut::<Module>()
                 .unwrap()
         } else {
+            // Find the root module in the scope
             let (id, root_pos) = modules.get(0);
 
             scope
@@ -441,28 +389,27 @@ fn search_scope<'s, 'a>(
                 .ok_or_else(|| Box::new(EvalAltResult::ErrorModuleNotFound(id.into(), *root_pos)))?
         };
 
-        return Ok((
-            module.get_qualified_var_mut(name, *hash_var, *pos)?,
-            name,
-            // Module variables are constant
-            ScopeEntryType::Constant,
-            *pos,
-        ));
-    }
+        let target = module.get_qualified_var_mut(name, *hash_var, *pos)?;
 
-    let index = if state.always_search { None } else { *index };
-
-    let index = if let Some(index) = index {
-        scope.len() - index.get()
+        // Module variables are constant
+        Ok((target, name, ScopeEntryType::Constant, *pos))
     } else {
-        scope
-            .get_index(name)
-            .ok_or_else(|| Box::new(EvalAltResult::ErrorVariableNotFound(name.into(), *pos)))?
-            .0
-    };
+        // Unqualified - check if it is directly indexed
+        let index = if state.always_search { None } else { *index };
 
-    let (val, typ) = scope.get_mut(index);
-    Ok((val, name, typ, *pos))
+        let index = if let Some(index) = index {
+            scope.len() - index.get()
+        } else {
+            // Find the variable in the scope
+            scope
+                .get_index(name)
+                .ok_or_else(|| Box::new(EvalAltResult::ErrorVariableNotFound(name.into(), *pos)))?
+                .0
+        };
+
+        let (val, typ) = scope.get_mut(index);
+        Ok((val, name, typ, *pos))
+    }
 }
 
 impl Engine {
@@ -575,9 +522,9 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         fn_name: &str,
-        hashes: (u64, u64),
+        (hash_fn, hash_script): (u64, u64),
         args: &mut FnCallArgs,
         is_ref: bool,
         def_val: Option<&Dynamic>,
@@ -585,7 +532,7 @@ impl Engine {
     ) -> Result<(Dynamic, bool), Box<EvalAltResult>> {
         self.inc_operations(state)?;
 
-        let native_only = hashes.1 == 0;
+        let native_only = hash_script == 0;
 
         // Check for stack overflow
         #[cfg(not(feature = "no_function"))]
@@ -634,12 +581,33 @@ impl Engine {
             }
         }
 
+        // Search for the function
         // First search in script-defined functions (can override built-in)
-        if !native_only {
-            if let Some(fn_def) = lib.get(&hashes.1) {
-                normalize_first_arg(is_ref, &mut this_copy, &mut old_this_ptr, args);
+        // Then search registered native functions (can override packages)
+        // Then search packages
+        // NOTE: We skip script functions for global_module and packages, and native functions for lib
+        let func = if !native_only {
+            lib.get_fn(hash_script) //.or_else(|| lib.get_fn(hash_fn))
+        } else {
+            None
+        }
+        //.or_else(|| self.global_module.get_fn(hash_script))
+        .or_else(|| self.global_module.get_fn(hash_fn))
+        //.or_else(|| self.packages.get_fn(hash_script))
+        .or_else(|| self.packages.get_fn(hash_fn));
 
+        if let Some(func) = func {
+            // Calling pure function in method-call?
+            normalize_first_arg(
+                (func.is_pure() || func.is_script()) && is_ref,
+                &mut this_copy,
+                &mut old_this_ptr,
+                args,
+            );
+
+            if func.is_script() {
                 // Run scripted function
+                let fn_def = func.get_fn_def();
                 let result =
                     self.call_script_fn(scope, state, lib, fn_name, fn_def, args, level)?;
 
@@ -647,53 +615,38 @@ impl Engine {
                 restore_first_arg(old_this_ptr, args);
 
                 return Ok((result, false));
+            } else {
+                // Run external function
+                let result = func.get_native_fn()(args)?;
+
+                // Restore the original reference
+                restore_first_arg(old_this_ptr, args);
+
+                // See if the function match print/debug (which requires special processing)
+                return Ok(match fn_name {
+                    KEYWORD_PRINT => (
+                        (self.print)(result.as_str().map_err(|type_name| {
+                            Box::new(EvalAltResult::ErrorMismatchOutputType(
+                                type_name.into(),
+                                Position::none(),
+                            ))
+                        })?)
+                        .into(),
+                        false,
+                    ),
+                    KEYWORD_DEBUG => (
+                        (self.debug)(result.as_str().map_err(|type_name| {
+                            Box::new(EvalAltResult::ErrorMismatchOutputType(
+                                type_name.into(),
+                                Position::none(),
+                            ))
+                        })?)
+                        .into(),
+                        false,
+                    ),
+                    _ => (result, func.is_method()),
+                });
             }
-        }
-
-        // Search built-in's and external functions
-        if let Some(func) = self
-            .global_module
-            .get_fn(hashes.0)
-            .or_else(|| self.packages.get_fn(hashes.0))
-        {
-            // Calling pure function in method-call?
-            normalize_first_arg(
-                func.is_pure() && is_ref,
-                &mut this_copy,
-                &mut old_this_ptr,
-                args,
-            );
-
-            // Run external function
-            let result = func.get_native_fn()(args)?;
-
-            // Restore the original reference
-            restore_first_arg(old_this_ptr, args);
-
-            // See if the function match print/debug (which requires special processing)
-            return Ok(match fn_name {
-                KEYWORD_PRINT => (
-                    (self.print)(result.as_str().map_err(|type_name| {
-                        Box::new(EvalAltResult::ErrorMismatchOutputType(
-                            type_name.into(),
-                            Position::none(),
-                        ))
-                    })?)
-                    .into(),
-                    false,
-                ),
-                KEYWORD_DEBUG => (
-                    (self.debug)(result.as_str().map_err(|type_name| {
-                        Box::new(EvalAltResult::ErrorMismatchOutputType(
-                            type_name.into(),
-                            Position::none(),
-                        ))
-                    })?)
-                    .into(),
-                    false,
-                ),
-                _ => (result, func.is_method()),
-            });
         }
 
         // See if it is built in.
@@ -725,22 +678,44 @@ impl Engine {
             )));
         }
 
-        let types_list: Vec<_> = args
-            .iter()
-            .map(|name| self.map_type_name(name.type_name()))
-            .collect();
-
-        // Getter function not found?
-        if fn_name == FUNC_INDEXER {
+        // index getter function not found?
+        if fn_name == FUNC_INDEXER_GET && args.len() == 2 {
             return Err(Box::new(EvalAltResult::ErrorFunctionNotFound(
-                format!("[]({})", types_list.join(", ")),
+                format!(
+                    "{} [{}]",
+                    self.map_type_name(args[0].type_name()),
+                    self.map_type_name(args[1].type_name()),
+                ),
+                Position::none(),
+            )));
+        }
+
+        // index setter function not found?
+        if fn_name == FUNC_INDEXER_SET {
+            return Err(Box::new(EvalAltResult::ErrorFunctionNotFound(
+                format!(
+                    "{} [{}]=",
+                    self.map_type_name(args[0].type_name()),
+                    self.map_type_name(args[1].type_name()),
+                ),
                 Position::none(),
             )));
         }
 
         // Raise error
         Err(Box::new(EvalAltResult::ErrorFunctionNotFound(
-            format!("{} ({})", fn_name, types_list.join(", ")),
+            format!(
+                "{} ({})",
+                fn_name,
+                args.iter()
+                    .map(|name| if name.is::<ImmutableString>() {
+                        "&str | ImmutableString"
+                    } else {
+                        self.map_type_name(name.type_name())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Position::none(),
         )))
     }
@@ -757,9 +732,9 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         fn_name: &str,
-        fn_def: &FnDef,
+        fn_def: &ScriptFnDef,
         args: &mut FnCallArgs,
         level: usize,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
@@ -809,13 +784,18 @@ impl Engine {
     }
 
     // Has a system function an override?
-    fn has_override(&self, lib: &FunctionsLib, hashes: (u64, u64)) -> bool {
-        // First check registered functions
-        self.global_module.contains_fn(hashes.0)
-            // Then check packages
-            || self.packages.contains_fn(hashes.0)
-            // Then check script-defined functions
-            || lib.contains_key(&hashes.1)
+    fn has_override(&self, lib: &Module, (hash_fn, hash_script): (u64, u64)) -> bool {
+        // NOTE: We skip script functions for global_module and packages, and native functions for lib
+
+        // First check script-defined functions
+        lib.contains_fn(hash_script)
+        //|| lib.contains_fn(hash_fn)
+        // Then check registered functions
+        //|| self.global_module.contains_fn(hash_script)
+        || self.global_module.contains_fn(hash_fn)
+        // Then check packages
+        //|| self.packages.contains_fn(hash_script)
+        || self.packages.contains_fn(hash_fn)
     }
 
     /// Perform an actual function call, taking care of special functions
@@ -829,23 +809,19 @@ impl Engine {
     fn exec_fn_call(
         &self,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         fn_name: &str,
         native_only: bool,
-        hash_fn_def: u64,
+        hash_script: u64,
         args: &mut FnCallArgs,
         is_ref: bool,
         def_val: Option<&Dynamic>,
         level: usize,
     ) -> Result<(Dynamic, bool), Box<EvalAltResult>> {
         // Qualifiers (none) + function name + number of arguments + argument `TypeId`'s.
-        let hash_fn = calc_fn_hash(
-            empty(),
-            fn_name,
-            args.len(),
-            args.iter().map(|a| a.type_id()),
-        );
-        let hashes = (hash_fn, if native_only { 0 } else { hash_fn_def });
+        let arg_types = args.iter().map(|a| a.type_id());
+        let hash_fn = calc_fn_hash(empty(), fn_name, args.len(), arg_types);
+        let hashes = (hash_fn, if native_only { 0 } else { hash_script });
 
         match fn_name {
             // type_of
@@ -878,7 +854,7 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         script: &Dynamic,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let script = script.as_str().map_err(|type_name| {
@@ -894,10 +870,8 @@ impl Engine {
         )?;
 
         // If new functions are defined within the eval string, it is an error
-        if !ast.lib().is_empty() {
-            return Err(Box::new(EvalAltResult::ErrorParsing(
-                ParseErrorType::WrongFnDefinition.into_err(Position::none()),
-            )));
+        if ast.lib().num_fn() != 0 {
+            return Err(ParseErrorType::WrongFnDefinition.into());
         }
 
         let statements = mem::take(ast.statements_mut());
@@ -917,7 +891,7 @@ impl Engine {
     fn eval_dot_index_chain_helper(
         &self,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         target: &mut Target,
         rhs: &Expr,
         idx_values: &mut StaticVec<Dynamic>,
@@ -934,6 +908,9 @@ impl Engine {
         let mut idx_val = idx_values.pop();
 
         if is_index {
+            #[cfg(feature = "no_index")]
+            unreachable!();
+
             let pos = rhs.position();
 
             match rhs {
@@ -942,8 +919,8 @@ impl Engine {
                     let (idx, expr, pos) = x.as_ref();
                     let is_idx = matches!(rhs, Expr::Index(_));
                     let idx_pos = idx.position();
-                    let this_ptr = &mut self
-                        .get_indexed_mut(state, lib, obj, is_ref, idx_val, idx_pos, false)?;
+                    let this_ptr =
+                        &mut self.get_indexed_mut(state, lib, target, idx_val, idx_pos, false)?;
 
                     self.eval_dot_index_chain_helper(
                         state, lib, this_ptr, expr, idx_values, is_idx, level, new_val,
@@ -952,17 +929,52 @@ impl Engine {
                 }
                 // xxx[rhs] = new_val
                 _ if new_val.is_some() => {
-                    let this_ptr =
-                        &mut self.get_indexed_mut(state, lib, obj, is_ref, idx_val, pos, true)?;
+                    let mut idx_val2 = idx_val.clone();
 
-                    this_ptr
-                        .set_value(new_val.unwrap())
-                        .map_err(|err| EvalAltResult::new_position(err, rhs.position()))?;
-                    Ok((Default::default(), true))
+                    match self.get_indexed_mut(state, lib, target, idx_val, pos, true) {
+                        // Indexed value is an owned value - the only possibility is an indexer
+                        // Try to call an index setter
+                        Ok(this_ptr) if this_ptr.is_value() => {
+                            let fn_name = FUNC_INDEXER_SET;
+                            let args = &mut [target.as_mut(), &mut idx_val2, &mut new_val.unwrap()];
+
+                            self.exec_fn_call(state, lib, fn_name, true, 0, args, is_ref, None, 0)
+                                .or_else(|err| match *err {
+                                    // If there is no index setter, no need to set it back because the indexer is read-only
+                                    EvalAltResult::ErrorFunctionNotFound(s, _)
+                                        if s == FUNC_INDEXER_SET =>
+                                    {
+                                        Ok(Default::default())
+                                    }
+                                    _ => Err(err),
+                                })?;
+                        }
+                        // Indexed value is a reference - update directly
+                        Ok(ref mut this_ptr) => {
+                            this_ptr
+                                .set_value(new_val.unwrap())
+                                .map_err(|err| EvalAltResult::new_position(err, rhs.position()))?;
+                        }
+                        Err(err) => match *err {
+                            // No index getter - try to call an index setter
+                            EvalAltResult::ErrorIndexingType(_, _) => {
+                                let fn_name = FUNC_INDEXER_SET;
+                                let args =
+                                    &mut [target.as_mut(), &mut idx_val2, &mut new_val.unwrap()];
+
+                                self.exec_fn_call(
+                                    state, lib, fn_name, true, 0, args, is_ref, None, 0,
+                                )?;
+                            }
+                            // Error
+                            err => return Err(Box::new(err)),
+                        },
+                    }
+                    Ok(Default::default())
                 }
                 // xxx[rhs]
                 _ => self
-                    .get_indexed_mut(state, lib, obj, is_ref, idx_val, pos, false)
+                    .get_indexed_mut(state, lib, target, idx_val, pos, false)
                     .map(|v| (v.clone_into_dynamic(), false)),
             }
         } else {
@@ -992,8 +1004,7 @@ impl Engine {
                 Expr::Property(x) if obj.is::<Map>() && new_val.is_some() => {
                     let ((prop, _, _), pos) = x.as_ref();
                     let index = prop.clone().into();
-                    let mut val =
-                        self.get_indexed_mut(state, lib, obj, is_ref, index, *pos, true)?;
+                    let mut val = self.get_indexed_mut(state, lib, target, index, *pos, true)?;
 
                     val.set_value(new_val.unwrap())
                         .map_err(|err| EvalAltResult::new_position(err, rhs.position()))?;
@@ -1004,7 +1015,7 @@ impl Engine {
                 Expr::Property(x) if obj.is::<Map>() => {
                     let ((prop, _, _), pos) = x.as_ref();
                     let index = prop.clone().into();
-                    let val = self.get_indexed_mut(state, lib, obj, is_ref, index, *pos, false)?;
+                    let val = self.get_indexed_mut(state, lib, target, index, *pos, false)?;
 
                     Ok((val.clone_into_dynamic(), false))
                 }
@@ -1033,7 +1044,7 @@ impl Engine {
                     let mut val = if let Expr::Property(p) = prop {
                         let ((prop, _, _), _) = p.as_ref();
                         let index = prop.clone().into();
-                        self.get_indexed_mut(state, lib, obj, is_ref, index, *pos, false)?
+                        self.get_indexed_mut(state, lib, target, index, *pos, false)?
                     } else {
                         unreachable!();
                     };
@@ -1097,7 +1108,7 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         expr: &Expr,
         level: usize,
         new_val: Option<Dynamic>,
@@ -1166,7 +1177,7 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         expr: &Expr,
         idx_values: &mut StaticVec<Dynamic>,
         size: usize,
@@ -1211,14 +1222,16 @@ impl Engine {
     fn get_indexed_mut<'a>(
         &self,
         state: &mut State,
-        lib: &FunctionsLib,
-        val: &'a mut Dynamic,
-        is_ref: bool,
+        lib: &Module,
+        target: &'a mut Target,
         mut idx: Dynamic,
         idx_pos: Position,
         create: bool,
     ) -> Result<Target<'a>, Box<EvalAltResult>> {
         self.inc_operations(state)?;
+
+        let is_ref = target.is_ref();
+        let val = target.as_mut();
 
         match val {
             #[cfg(not(feature = "no_index"))]
@@ -1284,8 +1297,9 @@ impl Engine {
                 }
             }
 
+            #[cfg(not(feature = "no_index"))]
             _ => {
-                let fn_name = FUNC_INDEXER;
+                let fn_name = FUNC_INDEXER_GET;
                 let type_name = self.map_type_name(val.type_name());
                 let args = &mut [val, &mut idx];
                 self.exec_fn_call(state, lib, fn_name, true, 0, args, is_ref, None, 0)
@@ -1297,6 +1311,12 @@ impl Engine {
                         ))
                     })
             }
+
+            #[cfg(feature = "no_index")]
+            _ => Err(Box::new(EvalAltResult::ErrorIndexingType(
+                self.map_type_name(val.type_name()).into(),
+                Position::none(),
+            ))),
         }
     }
 
@@ -1305,7 +1325,7 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         lhs: &Expr,
         rhs: &Expr,
         level: usize,
@@ -1368,7 +1388,7 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         expr: &Expr,
         level: usize,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
@@ -1390,7 +1410,7 @@ impl Engine {
             Expr::Property(_) => unreachable!(),
 
             // Statement block
-            Expr::Stmt(stmt) => self.eval_stmt(scope, state, lib, &stmt.0, level),
+            Expr::Stmt(x) => self.eval_stmt(scope, state, lib, &x.0, level),
 
             // var op= rhs
             Expr::Assignment(x) if matches!(x.0, Expr::Variable(_)) => {
@@ -1603,7 +1623,7 @@ impl Engine {
 
             // Module-qualified function call
             Expr::FnCall(x) if x.1.is_some() => {
-                let ((name, _, pos), modules, hash_fn_def, args_expr, def_val) = x.as_ref();
+                let ((name, _, pos), modules, hash_script, args_expr, def_val) = x.as_ref();
                 let modules = modules.as_ref().unwrap();
 
                 let mut arg_values = args_expr
@@ -1628,13 +1648,13 @@ impl Engine {
                 };
 
                 // First search in script-defined functions (can override built-in)
-                let func = match module.get_qualified_fn(name, *hash_fn_def) {
+                let func = match module.get_qualified_fn(name, *hash_script) {
                     Err(err) if matches!(*err, EvalAltResult::ErrorFunctionNotFound(_, _)) => {
                         // Then search in Rust functions
                         self.inc_operations(state)
                             .map_err(|err| EvalAltResult::new_position(err, *pos))?;
 
-                        // Rust functions are indexed in two steps:
+                        // Qualified Rust functions are indexed in two steps:
                         // 1) Calculate a hash in a similar manner to script-defined functions,
                         //    i.e. qualifiers + function name + number of arguments.
                         // 2) Calculate a second hash with no qualifiers, empty function name,
@@ -1642,22 +1662,22 @@ impl Engine {
                         let hash_fn_args =
                             calc_fn_hash(empty(), "", 0, args.iter().map(|a| a.type_id()));
                         // 3) The final hash is the XOR of the two hashes.
-                        let hash_fn_native = *hash_fn_def ^ hash_fn_args;
+                        let hash_qualified_fn = *hash_script ^ hash_fn_args;
 
-                        module.get_qualified_fn(name, hash_fn_native)
+                        module.get_qualified_fn(name, hash_qualified_fn)
                     }
                     r => r,
                 };
 
                 match func {
-                    Ok(x) if x.is_script() => {
+                    Ok(f) if f.is_script() => {
                         let args = args.as_mut();
-                        let fn_def = x.get_fn_def();
+                        let fn_def = f.get_fn_def();
                         let mut scope = Scope::new();
                         self.call_script_fn(&mut scope, state, lib, name, fn_def, args, level)
                             .map_err(|err| EvalAltResult::new_position(err, *pos))
                     }
-                    Ok(x) => x.get_native_fn()(args.as_mut()).map_err(|err| err.new_position(*pos)),
+                    Ok(f) => f.get_native_fn()(args.as_mut()).map_err(|err| err.new_position(*pos)),
                     Err(err)
                         if def_val.is_some()
                             && matches!(*err, EvalAltResult::ErrorFunctionNotFound(_, _)) =>
@@ -1719,7 +1739,7 @@ impl Engine {
         &self,
         scope: &mut Scope,
         state: &mut State,
-        lib: &FunctionsLib,
+        lib: &Module,
         stmt: &Stmt,
         level: usize,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
