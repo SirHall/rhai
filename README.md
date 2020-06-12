@@ -738,7 +738,7 @@ use rhai::Dynamic;
 
 let x = (42_i64).into();                        // 'into()' works for standard types
 
-let y = Dynamic::from(String::from("hello!"));  // remember &str is not supported by Rhai
+let y = Dynamic::from("hello!".to_string());    // remember &str is not supported by Rhai
 ```
 
 Functions registered with the [`Engine`] can be _overloaded_ as long as the _signature_ is unique,
@@ -1124,14 +1124,14 @@ not available under [`no_index`].
 To use custom types for `print` and `debug`, or convert its value into a [string], it is necessary that the following
 functions be registered (assuming the custom type is `T : Display + Debug`):
 
-| Function    | Signature                                        | Typical implementation         | Usage                                                                                   |
-| ----------- | ------------------------------------------------ | ------------------------------ | --------------------------------------------------------------------------------------- |
-| `to_string` | `|s: &mut T| -> String`                          | `s.to_string()`                | Converts the custom type into a [string]                                                |
-| `print`     | `|s: &mut T| -> String`                          | `s.to_string()`                | Converts the custom type into a [string] for the [`print`](#print-and-debug) statement  |
-| `debug`     | `|s: &mut T| -> String`                          | `format!("{:?}", s)`           | Converts the custom type into a [string] for the [`debug`](#print-and-debug) statement  |
-| `+`         | `|s1: ImmutableString, s: T| -> ImmutableString` | `s1 + s`                       | Append the custom type to another [string], for `print("Answer: " + type);` usage       |
-| `+`         | `|s: T, s2: ImmutableString| -> String`          | `s.to_string().push_str(&s2);` | Append another [string] to the custom type, for `print(type + " is the answer");` usage |
-| `+=`        | `|s1: &mut ImmutableString, s: T|`               | `s1 += s.to_string()`          | Append the custom type to an existing [string], for `s += type;` usage                  |
+| Function    | Signature                                        | Typical implementation                | Usage                                                                                   |
+| ----------- | ------------------------------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------- |
+| `to_string` | `|s: &mut T| -> ImmutableString`                 | `s.to_string().into()`                | Converts the custom type into a [string]                                                |
+| `print`     | `|s: &mut T| -> ImmutableString`                 | `s.to_string().into()`                | Converts the custom type into a [string] for the [`print`](#print-and-debug) statement  |
+| `debug`     | `|s: &mut T| -> ImmutableString`                 | `format!("{:?}", s).into()`           | Converts the custom type into a [string] for the [`debug`](#print-and-debug) statement  |
+| `+`         | `|s1: ImmutableString, s: T| -> ImmutableString` | `s1 + s`                              | Append the custom type to another [string], for `print("Answer: " + type);` usage       |
+| `+`         | `|s: T, s2: ImmutableString| -> ImmutableString` | `s.to_string().push_str(&s2).into();` | Append another [string] to the custom type, for `print(type + " is the answer");` usage |
+| `+=`        | `|s1: &mut ImmutableString, s: T|`               | `s1 += s.to_string()`                 | Append the custom type to an existing [string], for `s += type;` usage                  |
 
 `Scope` - Initializing and maintaining state
 -------------------------------------------
